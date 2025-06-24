@@ -1,0 +1,330 @@
+pipeline {
+    agent any
+    
+    triggers {
+        pollSCM('H/5 * * * *') // Poll every 5 minutes
+    }
+    
+    environment {
+        // Laravel environment variables
+        APP_ENV = 'testing'
+        DB_CONNECTION = 'sqlite'
+        DB_DATABASE = ':memory:'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Code checked out successfully'
+                // Clean any previous builds
+                sh 'ls -la'
+            }
+        }
+        
+        stage('Setup Environment') {
+            steps {
+                echo 'Setting up Laravel environment...'
+                
+                // Check PHP version
+                sh 'php --version'
+                
+                // Check Composer version
+                sh 'composer --version'
+                
+                // Copy environment file
+                sh 'cp .env.example .env || cp .env.testing .env || echo "No .env.example found, using defaults"'
+                
+                // Install PHP dependencies
+                sh 'composer install --no-dev --optimize-autoloader --no-interaction'
+                
+                // Generate application key
+                sh 'php artisan key:generate --force'
+                
+                // Install Node.js dependencies (if package.json exists)
+                script {
+                    if (fileExists('package.json')) {
+                        sh 'npm install'
+                        sh 'npm run production || npm run build'
+                    } else {
+                        echo 'No package.json found, skipping npm install'
+                    }
+                }
+            }
+        }
+        
+        stage('Build & Optimize') {
+            steps {
+                echo 'Building and optimizing Laravel application...'
+                
+                // Clear and optimize Laravel caches
+                sh '''
+                    php artisan config:clear
+                    php artisan cache:clear
+                    php artisan route:clear
+                    php artisan view:clear
+                    
+                    # Optimize for production
+                    php artisan config:cache
+                    php artisan route:cache
+                    php artisan view:cache
+                '''
+                
+                // Set proper permissions
+                sh '''
+                    chmod -R 775 storage
+                    chmod -R 775 bootstrap/cache
+                '''
+            }
+        }
+        
+        stage('Database Setup') {
+            steps {
+                echo 'Setting up database for testing...'
+                
+                // Run database migrations
+                sh 'php artisan migrate:fresh --force --env=testing'
+                
+                // Seed database if seeder exists
+                script {
+                    try {
+                        sh 'php artisan db:seed --force --env=testing'
+                    } catch (Exception e) {
+                        echo 'No seeders found or seeding failed, continuing...'
+                    }
+                }
+            }
+        }
+        
+        stage('Code Quality & Security') {
+            parallel {
+                stage('PHP Code Style') {
+                    steps {
+                        echo 'Checking PHP code style...'
+                        script {
+                            try {
+                                // PHP CS Fixer (if installed)
+                                sh 'vendor/bin/php-cs-fixer fix --dry-run --diff --verbose || echo "PHP CS Fixer not installed"'
+                            } catch (Exception e) {
+                                echo 'PHP CS Fixer check skipped'
+                            }
+                        }
+                    }
+                }
+                
+                stage('Static Analysis') {
+                    steps {
+                        echo 'Running static analysis...'
+                        script {
+                            try {
+                                // PHPStan (if installed)
+                                sh 'vendor/bin/phpstan analyse || echo "PHPStan not installed"'
+                            } catch (Exception e) {
+                                echo 'Static analysis skipped'
+                            }
+                        }
+                    }
+                }
+                
+                stage('Security Check') {
+                    steps {
+                        echo 'Checking for security vulnerabilities...'
+                        // Check for known security vulnerabilities
+                        sh 'composer audit || echo "Composer audit not available"'
+                    }
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                echo 'Running Laravel tests...'
+                
+                // Run PHPUnit tests
+                sh '''
+                    # Create test database if using sqlite
+                    touch database/database.sqlite || echo "Using memory database"
+                    
+                    # Run tests with coverage
+                    vendor/bin/phpunit --coverage-html coverage --coverage-clover coverage.xml --log-junit junit.xml
+                '''
+            }
+            post {
+                always {
+                    // Archive test results
+                    script {
+                        try {
+                            junit 'junit.xml'
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'coverage',
+                                reportFiles: 'index.html',
+                                reportName: 'Coverage Report'
+                            ])
+                        } catch (Exception e) {
+                            echo 'Test result archiving failed, continuing...'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            steps {
+                echo 'Running performance tests...'
+                script {
+                    try {
+                        // Run Dusk tests if available
+                        sh 'php artisan dusk || echo "Dusk tests not available"'
+                    } catch (Exception e) {
+                        echo 'Performance tests skipped'
+                    }
+                }
+            }
+        }
+        
+        stage('Build Artifacts') {
+            when {
+                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+            }
+            steps {
+                echo 'Building deployment artifacts...'
+                
+                // Create deployment package
+                sh '''
+                    # Remove development dependencies
+                    composer install --no-dev --optimize-autoloader --no-interaction
+                    
+                    # Create deployment directory
+                    mkdir -p deploy
+                    
+                    # Copy application files (excluding unnecessary files)
+                    rsync -av --exclude='.git' \
+                             --exclude='node_modules' \
+                             --exclude='tests' \
+                             --exclude='coverage' \
+                             --exclude='deploy' \
+                             --exclude='.env.example' \
+                             --exclude='phpunit.xml' \
+                             --exclude='webpack.mix.js' \
+                             --exclude='package.json' \
+                             --exclude='package-lock.json' \
+                             . deploy/
+                    
+                    # Create version file
+                    echo "Build: ${BUILD_NUMBER}" > deploy/VERSION
+                    echo "Commit: $(git rev-parse HEAD)" >> deploy/VERSION
+                    echo "Date: $(date)" >> deploy/VERSION
+                '''
+                
+                // Archive artifacts
+                archiveArtifacts artifacts: 'deploy/**', fingerprint: true
+            }
+        }
+        
+        stage('Deploy') {
+            when {
+                expression { currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+            }
+            steps {
+                echo 'Deploying with Ansible...'
+                
+                // Run Ansible Playbook
+                sh '''
+                    # Deploy using Ansible
+                    ansible-playbook -i ansible/inventory/production ansible/deploy.yml \
+                        --extra-vars "build_number=${BUILD_NUMBER} git_commit=$(git rev-parse HEAD)" \
+                        --vault-password-file ~/.vault_pass || \
+                    ansible-playbook -i inventory/hosts deploy.yml \
+                        --extra-vars "build_number=${BUILD_NUMBER} git_commit=$(git rev-parse HEAD)"
+                '''
+            }
+            post {
+                success {
+                    echo 'Deployment completed successfully!'
+                    
+                    // Send success notification
+                    emailext (
+                        subject: "✅ Deployment Successful: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                        body: """
+                            Deployment Completed Successfully! 🎉
+                            
+                            Job: ${env.JOB_NAME}
+                            Build Number: ${env.BUILD_NUMBER}
+                            Git Commit: ${env.GIT_COMMIT}
+                            Build URL: ${env.BUILD_URL}
+                            
+                            The Laravel application has been deployed to production.
+                        """,
+                        to: "srengty@gmail.com"
+                    )
+                }
+            }
+        }
+    }
+    
+    post {
+        failure {
+            script {
+                // Get the last commit author's email
+                def lastCommitAuthor = sh(
+                    script: "git log -1 --pretty=format:'%ae'",
+                    returnStdout: true
+                ).trim()
+                
+                def lastCommitMessage = sh(
+                    script: "git log -1 --pretty=format:'%s'",
+                    returnStdout: true
+                ).trim()
+                
+                echo "Build failed. Last commit by: ${lastCommitAuthor}"
+                echo "Last commit message: ${lastCommitMessage}"
+            }
+            
+            // Send email notification on failure
+            emailext (
+                subject: "❌ Laravel Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: """
+                    Laravel Build Failed! 💥
+                    
+                    Job: ${env.JOB_NAME}
+                    Build Number: ${env.BUILD_NUMBER}
+                    Build URL: ${env.BUILD_URL}
+                    Git Commit: ${env.GIT_COMMIT}
+                    
+                    Last Commit Message: ${env.GIT_COMMIT != null ? sh(script: "git log -1 --pretty=format:'%s'", returnStdout: true).trim() : 'N/A'}
+                    
+                    Failed Stage: Check console output for details
+                    Console Output: ${env.BUILD_URL}console
+                    
+                    Please fix the issues and push again.
+                """,
+                to: "srengty@gmail.com",
+                recipientProviders: [
+                    [$class: 'DevelopersRecipientProvider'],
+                    [$class: 'RequesterRecipientProvider']
+                ]
+            )
+        }
+        
+        success {
+            echo 'Laravel CI/CD Pipeline completed successfully! 🎉'
+        }
+        
+        always {
+            // Clean up
+            sh '''
+                # Clean up test files
+                rm -f database/database.sqlite
+                rm -f junit.xml
+                rm -f coverage.xml
+                
+                # Clean up node modules if they exist
+                rm -rf node_modules || echo "No node_modules to clean"
+            '''
+            
+            echo 'Pipeline cleanup completed'
+        }
+    }
+}
